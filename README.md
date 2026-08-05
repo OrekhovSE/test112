@@ -4,7 +4,16 @@
 prepare_dataset.py
 ==================
 
-Скрипт подготавливает YOLO-датасет со структурой:
+Назначение
+----------
+Один скрипт для обслуживания YOLO-датасета:
+
+    cleanup   удалить лишние labels, для которых нет изображения;
+    annotate  создать отсутствующие labels с помощью container.pt и text.pt;
+    split     создать обучающие датасеты container и text;
+    all       выполнить cleanup -> annotate -> split.
+
+Исходная структура:
 
 master_dataset/
 ├── images/
@@ -32,107 +41,59 @@ master_dataset/
         ├── twolines/
         └── unknown/
 
-Классы:
-    0 — container_bbox
-    1 — text
+Исходные классы:
+    0 container_bbox
+    1 text
 
-Веса container.pt и text.pt хранятся отдельно в КАЖДОЙ соответствующей
-папке labels. Например:
+Веса container.pt и text.pt ищутся в соответствующей папке labels.
+Например для images/yantar/vertical/a.jpg используются:
+    labels/yantar/vertical/container.pt
+    labels/yantar/vertical/text.pt
 
-    images/vertical/a.jpg
-        -> labels/vertical/container.pt
-        -> labels/vertical/text.pt
-
-    images/yantar/vertical/b.jpg
-        -> labels/yantar/vertical/container.pt
-        -> labels/yantar/vertical/text.pt
-
-Установка зависимостей для этапа annotate:
-
+Установка зависимостей:
     pip install ultralytics opencv-python
 
-Примеры запуска
----------------
-
-1. Удалить аннотации, для которых нет изображения:
-
+Запуск:
     python prepare_dataset.py cleanup --dataset-root master_dataset
-
-2. Создать отсутствующие аннотации:
-
     python prepare_dataset.py annotate --dataset-root master_dataset
-
-3. Пересоздать все аннотации, включая существующие:
-
     python prepare_dataset.py annotate --dataset-root master_dataset --overwrite
+    python prepare_dataset.py split --dataset-root master_dataset --output split_datasets
+    python prepare_dataset.py all --dataset-root master_dataset --output split_datasets
 
-4. Создать отдельные train/val датасеты по типам номеров:
-
-    python prepare_dataset.py split \
-        --dataset-root master_dataset \
-        --output split_datasets \
-        --train-ratio 0.8 \
-        --seed 42
-
-5. Выполнить cleanup, annotate и split последовательно:
-
-    python prepare_dataset.py all \
-        --dataset-root master_dataset \
-        --output split_datasets
-
-Дополнительные параметры:
-
-    --expand 0.25
-        Увеличить ширину и высоту container crop на 25% перед запуском text.pt.
-        При значении 0.25 с каждой стороны добавляется примерно 12.5% размера bbox.
-
-    --container-conf 0.25
-        Минимальная уверенность container.pt.
-
-    --text-conf 0.25
-        Минимальная уверенность text.pt.
-
-    --device cpu
-    --device 0
-        Устройство Ultralytics. Если параметр не задан, используется выбор
-        Ultralytics по умолчанию.
-
-    --copy-mode copy
-    --copy-mode hardlink
-        Способ формирования split. hardlink экономит место, если источник
-        и результат находятся на одном диске.
-
-Результат split
----------------
+Результат split:
 
 split_datasets/
-├── vertical/
-│   ├── images/
-│   │   ├── train/
-│   │   └── val/
-│   ├── labels/
-│   │   ├── train/
-│   │   └── val/
+├── container/
+│   ├── images/train/
+│   ├── images/val/
+│   ├── labels/train/
+│   ├── labels/val/
 │   ├── classes.txt
 │   └── data.yaml
-├── oneline/
-├── twolines/
-└── unknown/
+└── text/
+    ├── vertical/
+    │   ├── images/train/
+    │   ├── images/val/
+    │   ├── labels/train/
+    │   ├── labels/val/
+    │   ├── classes.txt
+    │   └── data.yaml
+    ├── oneline/
+    └── twolines/
 
-Обычные данные и данные yantar делятся отдельно в пропорции 0.8/0.2,
-а затем объединяются. Поэтому доля yantar получается максимально одинаковой
-в train и val. Для предотвращения совпадений имён используются префиксы:
-
-    regular__имя_файла.jpg
-    yantar__имя_файла.jpg
-
-ВАЖНО:
+Правила split:
+    - unknown и yantar/unknown не используются;
+    - container объединяет vertical, oneline, twolines и yantar-варианты;
+    - container labels содержат только класс 0 container_bbox;
+    - изображения без container_bbox включаются в container с пустым label;
+    - text создаётся отдельно для vertical/oneline/twolines;
+    - text-изображение — crop container_bbox, увеличенный на 25% по ширине
+      и высоте (по 12.5% с каждой стороны при --expand 0.25);
+    - исходные классы 1 пересчитываются относительно crop и записываются
+      как класс 0 text;
+    - сначала собираются валидные text crops, затем regular и yantar
+      независимо делятся на train/val, чтобы сохранять их пропорцию;
     - classes.txt никогда не удаляется.
-    - container.pt и text.pt никогда не удаляются и не копируются в split.
-    - annotate по умолчанию не изменяет существующие *.txt.
-    - если container.pt отсутствует, создаётся пустой label.
-    - если container найден, но text.pt отсутствует, записывается только класс 0.
-    - если container не найден, создаётся пустой label.
 """
 
 from __future__ import annotations
@@ -143,24 +104,41 @@ import os
 import random
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
-IMAGE_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"
-}
-NUMBER_TYPES = ("vertical", "oneline", "twolines", "unknown")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+ALL_TYPES = ("vertical", "oneline", "twolines", "unknown")
+TRAIN_TYPES = ("vertical", "oneline", "twolines")
 SOURCES = ("regular", "yantar")
 PROTECTED_TEXT_FILES = {"classes.txt"}
 
 
 @dataclass(frozen=True)
-class DatasetGroup:
+class Group:
     number_type: str
     source: str
     image_dir: Path
     label_dir: Path
+
+
+@dataclass(frozen=True)
+class SourceSample:
+    number_type: str
+    source: str
+    image_path: Path
+    label_path: Path
+
+
+@dataclass(frozen=True)
+class TextCrop:
+    number_type: str
+    source: str
+    image_path: Path
+    label_lines: tuple[str, ...]
+    name: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -168,604 +146,489 @@ def parse_args() -> argparse.Namespace:
         description="Подготовка YOLO-датасета: cleanup, annotate, split или all.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("stage", choices=("cleanup", "annotate", "split", "all"))
+    parser.add_argument("--dataset-root", type=Path, default=Path("master_dataset"))
+    parser.add_argument("--output", type=Path, default=Path("split_datasets"))
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--expand", type=float, default=0.25)
+    parser.add_argument("--container-conf", type=float, default=0.25)
+    parser.add_argument("--text-conf", type=float, default=0.25)
+    parser.add_argument("--device", default=None, help="Например cpu, 0 или 0,1")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--copy-mode", choices=("copy", "hardlink"), default="copy")
+    parser.add_argument("--keep-output", action="store_true")
     parser.add_argument(
-        "stage",
-        choices=("cleanup", "annotate", "split", "all"),
-        help="Этап, который необходимо выполнить.",
-    )
-    parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=Path("master_dataset"),
-        help="Корень исходного датасета.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("split_datasets"),
-        help="Папка результирующих split-датасетов.",
-    )
-    parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.8,
-        help="Доля изображений, попадающих в train.",
-    )
-    parser.add_argument(
-        "--expand",
-        type=float,
-        default=0.25,
-        help="Относительное увеличение ширины/высоты crop контейнера.",
-    )
-    parser.add_argument(
-        "--container-conf",
-        type=float,
-        default=0.25,
-        help="Confidence threshold для container.pt.",
-    )
-    parser.add_argument(
-        "--text-conf",
-        type=float,
-        default=0.25,
-        help="Confidence threshold для text.pt.",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="Устройство Ultralytics, например cpu, 0 или 0,1.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed воспроизводимого разбиения.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Перезаписывать существующие аннотации на этапе annotate.",
-    )
-    parser.add_argument(
-        "--copy-mode",
-        choices=("copy", "hardlink"),
-        default="copy",
-        help="Копировать файлы либо создавать hard links при split.",
-    )
-    parser.add_argument(
-        "--keep-output",
-        action="store_true",
-        help="Не очищать существующую папку конкретного типа перед split.",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        default="INFO",
-        help="Уровень логирования.",
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO"
     )
     args = parser.parse_args()
 
     if not 0.0 < args.train_ratio < 1.0:
-        parser.error("--train-ratio должен находиться между 0 и 1.")
-    if args.expand < 0.0:
-        parser.error("--expand не может быть отрицательным.")
-    if not 0.0 <= args.container_conf <= 1.0:
-        parser.error("--container-conf должен находиться между 0 и 1.")
-    if not 0.0 <= args.text_conf <= 1.0:
-        parser.error("--text-conf должен находиться между 0 и 1.")
-
+        parser.error("--train-ratio должен быть между 0 и 1")
+    if args.expand < 0:
+        parser.error("--expand не может быть отрицательным")
+    if not 0 <= args.container_conf <= 1:
+        parser.error("--container-conf должен быть между 0 и 1")
+    if not 0 <= args.text_conf <= 1:
+        parser.error("--text-conf должен быть между 0 и 1")
     return args
 
 
-def iter_groups(dataset_root: Path) -> Iterable[DatasetGroup]:
-    images_root = dataset_root / "images"
-    labels_root = dataset_root / "labels"
+def get_group(root: Path, number_type: str, source: str) -> Group:
+    if source == "regular":
+        return Group(number_type, source, root / "images" / number_type, root / "labels" / number_type)
+    return Group(
+        number_type,
+        source,
+        root / "images" / "yantar" / number_type,
+        root / "labels" / "yantar" / number_type,
+    )
 
-    for number_type in NUMBER_TYPES:
-        yield DatasetGroup(
-            number_type=number_type,
-            source="regular",
-            image_dir=images_root / number_type,
-            label_dir=labels_root / number_type,
-        )
-        yield DatasetGroup(
-            number_type=number_type,
-            source="yantar",
-            image_dir=images_root / "yantar" / number_type,
-            label_dir=labels_root / "yantar" / number_type,
-        )
+
+def all_groups(root: Path, types: Sequence[str] = ALL_TYPES):
+    for number_type in types:
+        for source in SOURCES:
+            yield get_group(root, number_type, source)
 
 
 def list_images(directory: Path) -> list[Path]:
     if not directory.is_dir():
         return []
     return sorted(
-        path
-        for path in directory.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
 
 
-def image_stems(directory: Path) -> set[str]:
-    return {path.stem for path in list_images(directory)}
+def safe_name(number_type: str, source: str, stem: str) -> str:
+    return f"{source}__{number_type}__{stem}"
 
 
-def cleanup_orphan_labels(dataset_root: Path) -> int:
+def write_label(path: Path, lines: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(lines)
+    path.write_text(content + ("\n" if content else ""), encoding="utf-8")
+
+
+def cleanup_orphan_labels(root: Path) -> int:
     removed = 0
-
-    for group in iter_groups(dataset_root):
+    for group in all_groups(root):
         if not group.label_dir.is_dir():
             continue
-
-        stems = image_stems(group.image_dir)
-        for label_path in sorted(group.label_dir.glob("*.txt")):
-            if label_path.name.lower() in PROTECTED_TEXT_FILES:
+        stems = {p.stem for p in list_images(group.image_dir)}
+        for txt in sorted(group.label_dir.glob("*.txt")):
+            if txt.name.lower() in PROTECTED_TEXT_FILES:
                 continue
-            if label_path.stem not in stems:
-                label_path.unlink()
+            if txt.stem not in stems:
+                txt.unlink()
                 removed += 1
-                logging.info("Удалён label без изображения: %s", label_path)
-
-    logging.info("Cleanup завершён. Удалено labels: %d", removed)
+                logging.info("Удалён label без изображения: %s", txt)
+    logging.info("Cleanup завершён. Удалено: %d", removed)
     return removed
 
 
 class ModelCache:
     def __init__(self) -> None:
-        self._models: dict[Path, object] = {}
+        self.models: dict[Path, object] = {}
 
-    def get(self, weights_path: Path):
-        resolved = weights_path.resolve()
-        if resolved not in self._models:
+    def get(self, weights: Path):
+        key = weights.resolve()
+        if key not in self.models:
             try:
                 from ultralytics import YOLO
             except ImportError as exc:
-                raise RuntimeError(
-                    "Для annotate установите ultralytics: pip install ultralytics"
-                ) from exc
-            logging.info("Загрузка весов: %s", weights_path)
-            self._models[resolved] = YOLO(str(weights_path))
-        return self._models[resolved]
+                raise RuntimeError("Установите ultralytics: pip install ultralytics") from exc
+            logging.info("Загрузка весов: %s", weights)
+            self.models[key] = YOLO(str(weights))
+        return self.models[key]
 
 
-def predict_xyxy(
-    model,
-    image,
-    confidence: float,
-    device: Optional[str],
-) -> list[tuple[float, float, float, float, float]]:
-    kwargs = {
-        "source": image,
-        "conf": confidence,
-        "verbose": False,
-    }
+def predict_xyxy(model, image, conf: float, device: Optional[str]):
+    kwargs = {"source": image, "conf": conf, "verbose": False}
     if device is not None:
         kwargs["device"] = device
-
     results = model.predict(**kwargs)
-    detections: list[tuple[float, float, float, float, float]] = []
-
-    if not results:
-        return detections
-
+    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+        return []
     boxes = results[0].boxes
-    if boxes is None or len(boxes) == 0:
-        return detections
-
-    xyxy_values = boxes.xyxy.detach().cpu().tolist()
-    conf_values = boxes.conf.detach().cpu().tolist()
-
-    for coords, conf in zip(xyxy_values, conf_values):
-        x1, y1, x2, y2 = map(float, coords)
-        detections.append((x1, y1, x2, y2, float(conf)))
-
-    return detections
+    coords = boxes.xyxy.detach().cpu().tolist()
+    scores = boxes.conf.detach().cpu().tolist()
+    return [(*map(float, box), float(score)) for box, score in zip(coords, scores)]
 
 
-def clip_box(
-    box: Sequence[float],
-    width: int,
-    height: int,
-) -> tuple[float, float, float, float]:
-    x1, y1, x2, y2 = box
-    x1 = max(0.0, min(float(width), x1))
-    y1 = max(0.0, min(float(height), y1))
-    x2 = max(0.0, min(float(width), x2))
-    y2 = max(0.0, min(float(height), y2))
-    return x1, y1, x2, y2
+def clip_box(box: Sequence[float], width: int, height: int):
+    x1, y1, x2, y2 = map(float, box)
+    return (
+        max(0.0, min(float(width), x1)),
+        max(0.0, min(float(height), y1)),
+        max(0.0, min(float(width), x2)),
+        max(0.0, min(float(height), y2)),
+    )
 
 
-def expand_box(
-    box: Sequence[float],
-    width: int,
-    height: int,
-    expand_ratio: float,
-) -> tuple[int, int, int, int]:
+def expand_box(box: Sequence[float], width: int, height: int, ratio: float):
     x1, y1, x2, y2 = clip_box(box, width, height)
-    box_width = max(0.0, x2 - x1)
-    box_height = max(0.0, y2 - y1)
-
-    pad_x = box_width * expand_ratio / 2.0
-    pad_y = box_height * expand_ratio / 2.0
-
-    expanded = clip_box(
-        (x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y),
-        width,
-        height,
+    pad_x = max(0.0, x2 - x1) * ratio / 2.0
+    pad_y = max(0.0, y2 - y1) * ratio / 2.0
+    x1, y1, x2, y2 = clip_box(
+        (x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), width, height
     )
-    ex1, ey1, ex2, ey2 = expanded
-    return (
-        int(ex1),
-        int(ey1),
-        int(ex2 + 0.999999),
-        int(ey2 + 0.999999),
-    )
+    return int(x1), int(y1), min(width, int(x2 + 0.999999)), min(height, int(y2 + 0.999999))
 
 
-def xyxy_to_yolo(
-    box: Sequence[float],
-    image_width: int,
-    image_height: int,
-    class_id: int,
-) -> Optional[str]:
-    x1, y1, x2, y2 = clip_box(box, image_width, image_height)
-    box_width = x2 - x1
-    box_height = y2 - y1
-
-    if box_width <= 0.0 or box_height <= 0.0:
+def xyxy_to_yolo(box: Sequence[float], width: int, height: int, class_id: int) -> Optional[str]:
+    x1, y1, x2, y2 = clip_box(box, width, height)
+    if x2 <= x1 or y2 <= y1 or width <= 0 or height <= 0:
         return None
+    xc = (x1 + x2) / 2.0 / width
+    yc = (y1 + y2) / 2.0 / height
+    bw = (x2 - x1) / width
+    bh = (y2 - y1) / height
+    return f"{class_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}"
 
-    center_x = (x1 + x2) / 2.0 / image_width
-    center_y = (y1 + y2) / 2.0 / image_height
-    norm_width = box_width / image_width
-    norm_height = box_height / image_height
 
-    values = (center_x, center_y, norm_width, norm_height)
-    values = tuple(max(0.0, min(1.0, value)) for value in values)
-
+def yolo_to_xyxy(line: str, width: int, height: int):
+    parts = line.split()
+    if len(parts) != 5:
+        return None
+    try:
+        class_id = int(float(parts[0]))
+        xc, yc, bw, bh = map(float, parts[1:])
+    except ValueError:
+        return None
     return (
-        f"{class_id} "
-        f"{values[0]:.6f} {values[1]:.6f} "
-        f"{values[2]:.6f} {values[3]:.6f}"
+        class_id,
+        *clip_box(
+            (
+                (xc - bw / 2.0) * width,
+                (yc - bh / 2.0) * height,
+                (xc + bw / 2.0) * width,
+                (yc + bh / 2.0) * height,
+            ),
+            width,
+            height,
+        ),
     )
 
 
-def write_label(label_path: Path, lines: Sequence[str]) -> None:
-    label_path.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(lines)
-    if content:
-        content += "\n"
-    label_path.write_text(content, encoding="utf-8")
+def read_labels(path: Path, width: int, height: int):
+    if not path.is_file():
+        return []
+    result = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parsed = yolo_to_xyxy(raw.strip(), width, height)
+        if parsed is not None:
+            result.append(parsed)
+    return result
+
+
+def choose_container(labels):
+    boxes = [item[1:] for item in labels if item[0] == 0]
+    if not boxes:
+        return None
+    return max(boxes, key=lambda b: max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1]))
 
 
 def annotate_missing_labels(
-    dataset_root: Path,
+    root: Path,
     expand_ratio: float,
     container_conf: float,
     text_conf: float,
     device: Optional[str],
     overwrite: bool,
-) -> dict[str, int]:
+):
     try:
         import cv2
     except ImportError as exc:
-        raise RuntimeError(
-            "Для annotate установите OpenCV: pip install opencv-python"
-        ) from exc
+        raise RuntimeError("Установите opencv-python: pip install opencv-python") from exc
 
     cache = ModelCache()
-    stats = {
-        "processed": 0,
-        "skipped_existing": 0,
-        "empty_no_container_weights": 0,
-        "empty_no_detection": 0,
-        "container_only": 0,
-        "container_and_text": 0,
-        "read_errors": 0,
-    }
+    stats = {"processed": 0, "skipped": 0, "empty": 0, "container_only": 0, "with_text": 0}
 
-    for group in iter_groups(dataset_root):
-        images = list_images(group.image_dir)
-        if not images:
-            continue
-
+    for group in all_groups(root):
         group.label_dir.mkdir(parents=True, exist_ok=True)
         container_weights = group.label_dir / "container.pt"
         text_weights = group.label_dir / "text.pt"
 
-        for image_path in images:
+        for image_path in list_images(group.image_dir):
             label_path = group.label_dir / f"{image_path.stem}.txt"
-
             if label_path.exists() and not overwrite:
-                stats["skipped_existing"] += 1
+                stats["skipped"] += 1
                 continue
-
             stats["processed"] += 1
 
             if not container_weights.is_file():
                 write_label(label_path, [])
-                stats["empty_no_container_weights"] += 1
-                logging.warning(
-                    "Нет %s; создан пустой label: %s",
-                    container_weights,
-                    label_path,
-                )
+                stats["empty"] += 1
+                logging.warning("Нет %s; создан пустой %s", container_weights, label_path)
                 continue
 
             image = cv2.imread(str(image_path))
             if image is None:
                 write_label(label_path, [])
-                stats["read_errors"] += 1
-                logging.error("Не удалось прочитать изображение: %s", image_path)
+                stats["empty"] += 1
+                logging.error("Не удалось прочитать %s", image_path)
                 continue
 
-            image_height, image_width = image.shape[:2]
-            container_model = cache.get(container_weights)
-            container_detections = predict_xyxy(
-                container_model,
-                image,
-                container_conf,
-                device,
-            )
-
-            if not container_detections:
+            h, w = image.shape[:2]
+            detections = predict_xyxy(cache.get(container_weights), image, container_conf, device)
+            if not detections:
                 write_label(label_path, [])
-                stats["empty_no_detection"] += 1
-                logging.info("Контейнер не найден: %s", image_path)
+                stats["empty"] += 1
                 continue
 
-            # Для container_bbox выбирается детекция с максимальной уверенностью.
-            best_container = max(container_detections, key=lambda item: item[4])
-            container_box = best_container[:4]
-
+            container = max(detections, key=lambda x: x[4])[:4]
             lines: list[str] = []
-            container_line = xyxy_to_yolo(
-                container_box,
-                image_width,
-                image_height,
-                class_id=0,
-            )
-            if container_line is not None:
+            container_line = xyxy_to_yolo(container, w, h, 0)
+            if container_line:
                 lines.append(container_line)
 
             if not text_weights.is_file():
                 write_label(label_path, lines)
                 stats["container_only"] += 1
-                logging.warning(
-                    "Нет %s; записан только container_bbox: %s",
-                    text_weights,
-                    label_path,
-                )
                 continue
 
-            crop_x1, crop_y1, crop_x2, crop_y2 = expand_box(
-                container_box,
-                image_width,
-                image_height,
-                expand_ratio,
-            )
-            crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
-
+            x1, y1, x2, y2 = expand_box(container, w, h, expand_ratio)
+            crop = image[y1:y2, x1:x2]
             if crop.size == 0:
                 write_label(label_path, lines)
                 stats["container_only"] += 1
-                logging.warning("Получен пустой crop: %s", image_path)
                 continue
 
-            text_model = cache.get(text_weights)
-            text_detections = predict_xyxy(
-                text_model,
-                crop,
-                text_conf,
-                device,
-            )
-
-            # Стабильный порядок: сверху вниз, затем слева направо.
-            text_detections.sort(key=lambda item: (item[1], item[0]))
-
-            for tx1, ty1, tx2, ty2, _confidence in text_detections:
-                source_box = (
-                    tx1 + crop_x1,
-                    ty1 + crop_y1,
-                    tx2 + crop_x1,
-                    ty2 + crop_y1,
-                )
-                text_line = xyxy_to_yolo(
-                    source_box,
-                    image_width,
-                    image_height,
-                    class_id=1,
-                )
-                if text_line is not None:
-                    lines.append(text_line)
+            text_detections = predict_xyxy(cache.get(text_weights), crop, text_conf, device)
+            text_detections.sort(key=lambda x: (x[1], x[0]))
+            for tx1, ty1, tx2, ty2, _ in text_detections:
+                line = xyxy_to_yolo((tx1 + x1, ty1 + y1, tx2 + x1, ty2 + y1), w, h, 1)
+                if line:
+                    lines.append(line)
 
             write_label(label_path, lines)
             if len(lines) > 1:
-                stats["container_and_text"] += 1
+                stats["with_text"] += 1
             else:
                 stats["container_only"] += 1
-
-            logging.info(
-                "Создан label: %s (container=1, text=%d)",
-                label_path,
-                max(0, len(lines) - 1),
-            )
 
     logging.info("Annotate завершён: %s", stats)
     return stats
 
 
-def split_group(
-    items: Sequence[Path],
-    train_ratio: float,
-    rng: random.Random,
-) -> tuple[list[Path], list[Path]]:
-    shuffled = list(items)
-    rng.shuffle(shuffled)
-    count = len(shuffled)
-
-    if count == 0:
+def split_list(items: Sequence, train_ratio: float, rng: random.Random):
+    values = list(items)
+    rng.shuffle(values)
+    if not values:
         return [], []
-    if count == 1:
-        return shuffled, []
-
-    train_count = round(count * train_ratio)
-    train_count = max(1, min(count - 1, train_count))
-
-    return shuffled[:train_count], shuffled[train_count:]
+    if len(values) == 1:
+        return values, []
+    train_count = round(len(values) * train_ratio)
+    train_count = max(1, min(len(values) - 1, train_count))
+    return values[:train_count], values[train_count:]
 
 
 def transfer_file(source: Path, destination: Path, mode: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-
     if destination.exists():
         destination.unlink()
-
     if mode == "hardlink":
         try:
             os.link(source, destination)
             return
         except OSError as exc:
-            logging.warning(
-                "Hardlink не создан (%s), используется копирование: %s",
-                exc,
-                source,
-            )
-
+            logging.warning("Hardlink не создан (%s), копирование: %s", exc, source)
     shutil.copy2(source, destination)
 
 
-def copy_split_item(
-    image_path: Path,
-    source_label_dir: Path,
-    destination_root: Path,
-    subset: str,
-    source_name: str,
-    copy_mode: str,
-) -> None:
-    prefix = "regular__" if source_name == "regular" else "yantar__"
-    output_stem = f"{prefix}{image_path.stem}"
+def prepare_dataset_dir(root: Path) -> None:
+    for subset in ("train", "val"):
+        (root / "images" / subset).mkdir(parents=True, exist_ok=True)
+        (root / "labels" / subset).mkdir(parents=True, exist_ok=True)
 
-    output_image = (
-        destination_root / "images" / subset / f"{output_stem}{image_path.suffix.lower()}"
+
+def write_metadata(root: Path, class_name: str) -> None:
+    (root / "classes.txt").write_text(class_name + "\n", encoding="utf-8")
+    (root / "data.yaml").write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n\n"
+        "names:\n"
+        f"  0: {class_name}\n",
+        encoding="utf-8",
     )
-    output_label = destination_root / "labels" / subset / f"{output_stem}.txt"
-    source_label = source_label_dir / f"{image_path.stem}.txt"
-
-    transfer_file(image_path, output_image, copy_mode)
-
-    if source_label.is_file():
-        transfer_file(source_label, output_label, copy_mode)
-    else:
-        # split может запускаться отдельно от annotate.
-        write_label(output_label, [])
-        logging.warning(
-            "Для изображения нет label; в split создан пустой: %s",
-            source_label,
-        )
 
 
-def find_classes_file(dataset_root: Path, number_type: str) -> Optional[Path]:
-    candidates = (
-        dataset_root / "labels" / number_type / "classes.txt",
-        dataset_root / "labels" / "yantar" / number_type / "classes.txt",
-        dataset_root / "labels" / "classes.txt",
-    )
-    return next((path for path in candidates if path.is_file()), None)
+def collect_source_samples(root: Path, number_type: str, source: str):
+    group = get_group(root, number_type, source)
+    return [
+        SourceSample(number_type, source, image_path, group.label_dir / f"{image_path.stem}.txt")
+        for image_path in list_images(group.image_dir)
+    ]
 
 
-def write_data_yaml(destination_root: Path) -> None:
-    yaml_content = """path: .
-train: images/train
-val: images/val
-
-names:
-  0: container_bbox
-  1: text
-"""
-    (destination_root / "data.yaml").write_text(yaml_content, encoding="utf-8")
-
-
-def create_splits(
-    dataset_root: Path,
+def create_container_dataset(
+    root: Path,
     output_root: Path,
     train_ratio: float,
     seed: int,
     copy_mode: str,
-    keep_output: bool,
-) -> dict[str, dict[str, int]]:
-    summary: dict[str, dict[str, int]] = {}
+):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("Установите opencv-python: pip install opencv-python") from exc
 
-    for type_index, number_type in enumerate(NUMBER_TYPES):
-        destination_root = output_root / number_type
+    destination = output_root / "container"
+    prepare_dataset_dir(destination)
+    stats = {"train": 0, "val": 0, "empty_labels": 0, "read_errors": 0}
 
-        if destination_root.exists() and not keep_output:
-            shutil.rmtree(destination_root)
-
-        for subset in ("train", "val"):
-            (destination_root / "images" / subset).mkdir(parents=True, exist_ok=True)
-            (destination_root / "labels" / subset).mkdir(parents=True, exist_ok=True)
-
-        counts = {
-            "regular_train": 0,
-            "regular_val": 0,
-            "yantar_train": 0,
-            "yantar_val": 0,
-        }
-
-        for source_index, source_name in enumerate(SOURCES):
-            if source_name == "regular":
-                image_dir = dataset_root / "images" / number_type
-                label_dir = dataset_root / "labels" / number_type
-            else:
-                image_dir = dataset_root / "images" / "yantar" / number_type
-                label_dir = dataset_root / "labels" / "yantar" / number_type
-
-            images = list_images(image_dir)
-            # Разные детерминированные RNG для каждого типа и источника.
+    # Стратификация одновременно по типу и источнику.
+    for type_index, number_type in enumerate(TRAIN_TYPES):
+        for source_index, source in enumerate(SOURCES):
+            samples = collect_source_samples(root, number_type, source)
             rng = random.Random(seed + type_index * 1000 + source_index)
-            train_items, val_items = split_group(images, train_ratio, rng)
+            train, val = split_list(samples, train_ratio, rng)
 
-            for subset, subset_items in (
-                ("train", train_items),
-                ("val", val_items),
-            ):
-                for image_path in subset_items:
-                    copy_split_item(
-                        image_path=image_path,
-                        source_label_dir=label_dir,
-                        destination_root=destination_root,
-                        subset=subset,
-                        source_name=source_name,
-                        copy_mode=copy_mode,
-                    )
-                counts[f"{source_name}_{subset}"] = len(subset_items)
+            for subset, subset_samples in (("train", train), ("val", val)):
+                for sample in subset_samples:
+                    image = cv2.imread(str(sample.image_path))
+                    if image is None:
+                        stats["read_errors"] += 1
+                        logging.error("Не удалось прочитать %s", sample.image_path)
+                        continue
+                    h, w = image.shape[:2]
+                    container = choose_container(read_labels(sample.label_path, w, h))
+                    lines: list[str] = []
+                    if container is not None:
+                        line = xyxy_to_yolo(container, w, h, 0)
+                        if line:
+                            lines.append(line)
+                    if not lines:
+                        stats["empty_labels"] += 1
 
-        classes_file = find_classes_file(dataset_root, number_type)
-        if classes_file is not None:
-            shutil.copy2(classes_file, destination_root / "classes.txt")
-        else:
-            (destination_root / "classes.txt").write_text(
-                "container_bbox\ntext\n",
-                encoding="utf-8",
-            )
+                    name = safe_name(sample.number_type, sample.source, sample.image_path.stem)
+                    dst_image = destination / "images" / subset / f"{name}{sample.image_path.suffix.lower()}"
+                    dst_label = destination / "labels" / subset / f"{name}.txt"
+                    transfer_file(sample.image_path, dst_image, copy_mode)
+                    write_label(dst_label, lines)
+                    stats[subset] += 1
 
-        write_data_yaml(destination_root)
-        summary[number_type] = counts
-        logging.info("Split %s: %s", number_type, counts)
+    write_metadata(destination, "container_bbox")
+    logging.info("Container dataset: %s", stats)
+    return stats
 
-    logging.info("Split завершён. Результат: %s", output_root)
+
+def build_text_crop(sample: SourceSample, temp_dir: Path, expand_ratio: float) -> Optional[TextCrop]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("Установите opencv-python: pip install opencv-python") from exc
+
+    image = cv2.imread(str(sample.image_path))
+    if image is None:
+        logging.warning("Text crop: не удалось прочитать %s", sample.image_path)
+        return None
+    h, w = image.shape[:2]
+    labels = read_labels(sample.label_path, w, h)
+    container = choose_container(labels)
+    text_boxes = [item[1:] for item in labels if item[0] == 1]
+    if container is None or not text_boxes:
+        return None
+
+    x1, y1, x2, y2 = expand_box(container, w, h, expand_ratio)
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    crop_h, crop_w = crop.shape[:2]
+
+    lines: list[str] = []
+    for tx1, ty1, tx2, ty2 in text_boxes:
+        ix1 = max(float(x1), tx1)
+        iy1 = max(float(y1), ty1)
+        ix2 = min(float(x2), tx2)
+        iy2 = min(float(y2), ty2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        line = xyxy_to_yolo((ix1 - x1, iy1 - y1, ix2 - x1, iy2 - y1), crop_w, crop_h, 0)
+        if line:
+            lines.append(line)
+    if not lines:
+        return None
+
+    name = safe_name(sample.number_type, sample.source, sample.image_path.stem)
+    temp_image = temp_dir / f"{name}.jpg"
+    temp_image.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(temp_image), crop):
+        return None
+    return TextCrop(sample.number_type, sample.source, temp_image, tuple(lines), name)
+
+
+def create_text_datasets(
+    root: Path,
+    output_root: Path,
+    train_ratio: float,
+    expand_ratio: float,
+    seed: int,
+):
+    summary = {}
+    with tempfile.TemporaryDirectory(prefix="yolo_text_crops_") as tmp:
+        temp_root = Path(tmp)
+
+        for type_index, number_type in enumerate(TRAIN_TYPES):
+            destination = output_root / "text" / number_type
+            prepare_dataset_dir(destination)
+            stats = {"train": 0, "val": 0, "invalid": 0}
+
+            # Сначала создаём все валидные crops, затем делим regular/yantar отдельно.
+            for source_index, source in enumerate(SOURCES):
+                valid: list[TextCrop] = []
+                for sample in collect_source_samples(root, number_type, source):
+                    crop = build_text_crop(sample, temp_root / number_type / source, expand_ratio)
+                    if crop is None:
+                        stats["invalid"] += 1
+                    else:
+                        valid.append(crop)
+
+                rng = random.Random(seed + 10000 + type_index * 1000 + source_index)
+                train, val = split_list(valid, train_ratio, rng)
+
+                for subset, crops in (("train", train), ("val", val)):
+                    for crop in crops:
+                        dst_image = destination / "images" / subset / f"{crop.name}.jpg"
+                        dst_label = destination / "labels" / subset / f"{crop.name}.txt"
+                        shutil.copy2(crop.image_path, dst_image)
+                        write_label(dst_label, crop.label_lines)
+                        stats[subset] += 1
+
+            write_metadata(destination, "text")
+            summary[number_type] = stats
+            logging.info("Text dataset %s: %s", number_type, stats)
+
     return summary
 
 
-def validate_dataset_root(dataset_root: Path) -> None:
-    images_root = dataset_root / "images"
-    labels_root = dataset_root / "labels"
+def create_splits(
+    root: Path,
+    output_root: Path,
+    train_ratio: float,
+    expand_ratio: float,
+    seed: int,
+    copy_mode: str,
+    keep_output: bool,
+):
+    if output_root.exists() and not keep_output:
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    if not images_root.is_dir():
-        raise FileNotFoundError(f"Не найдена папка images: {images_root}")
-    if not labels_root.exists():
-        labels_root.mkdir(parents=True, exist_ok=True)
-        logging.warning("Создана отсутствующая папка labels: %s", labels_root)
+    container_stats = create_container_dataset(root, output_root, train_ratio, seed, copy_mode)
+    text_stats = create_text_datasets(root, output_root, train_ratio, expand_ratio, seed)
+    logging.info("Split завершён: %s", output_root)
+    return {"container": container_stats, "text": text_stats}
+
+
+def validate_root(root: Path) -> None:
+    images = root / "images"
+    labels = root / "labels"
+    if not images.is_dir():
+        raise FileNotFoundError(f"Не найдена папка images: {images}")
+    labels.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> int:
@@ -776,37 +639,34 @@ def main() -> int:
     )
 
     try:
-        dataset_root = args.dataset_root.expanduser().resolve()
-        output_root = args.output.expanduser().resolve()
-        validate_dataset_root(dataset_root)
+        root = args.dataset_root.expanduser().resolve()
+        output = args.output.expanduser().resolve()
+        validate_root(root)
 
         if args.stage in ("cleanup", "all"):
-            cleanup_orphan_labels(dataset_root)
-
+            cleanup_orphan_labels(root)
         if args.stage in ("annotate", "all"):
             annotate_missing_labels(
-                dataset_root=dataset_root,
-                expand_ratio=args.expand,
-                container_conf=args.container_conf,
-                text_conf=args.text_conf,
-                device=args.device,
-                overwrite=args.overwrite,
+                root,
+                args.expand,
+                args.container_conf,
+                args.text_conf,
+                args.device,
+                args.overwrite,
             )
-
         if args.stage in ("split", "all"):
             create_splits(
-                dataset_root=dataset_root,
-                output_root=output_root,
-                train_ratio=args.train_ratio,
-                seed=args.seed,
-                copy_mode=args.copy_mode,
-                keep_output=args.keep_output,
+                root,
+                output,
+                args.train_ratio,
+                args.expand,
+                args.seed,
+                args.copy_mode,
+                args.keep_output,
             )
-
         return 0
-
     except KeyboardInterrupt:
-        logging.error("Операция прервана пользователем.")
+        logging.error("Операция прервана пользователем")
         return 130
     except Exception as exc:
         logging.exception("Ошибка: %s", exc)
